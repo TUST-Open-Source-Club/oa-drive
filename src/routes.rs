@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use club_auth_sdk::AuthUser;
 use club_common::{new_id, AppError, FieldError};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 use crate::entity::{node, share, space};
 use crate::repo;
@@ -1054,6 +1055,89 @@ pub async fn wopi_get_file(
     Ok(response)
 }
 
+/// 依据扩展名映射 OnlyOffice documentType。
+fn document_type(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "doc" | "docx" | "odt" | "rtf" | "txt" => Some("word"),
+        "xls" | "xlsx" | "ods" | "csv" => Some("cell"),
+        "ppt" | "pptx" | "odp" => Some("slide"),
+        "pdf" => Some("pdf"),
+        _ => None,
+    }
+}
+
+/// `GET /spaces/{id}/nodes/{node_id}/office-config`：返回 OnlyOffice 编辑器配置（含 JWT）。
+pub async fn office_config(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, node_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
+    if model.kind != node::KIND_FILE || model.deleted_at.is_some() {
+        return Err(AppError::not_found("DRIVE_NODE_NOT_FOUND", "文件不存在"));
+    }
+    let Some(secret) = state.config.onlyoffice_jwt_secret.as_deref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "code": "ONLYOFFICE_NOT_CONFIGURED", "message": "未配置 OnlyOffice" })),
+        )
+            .into_response());
+    };
+    let Some(document_type) = document_type(&model.name) else {
+        return Err(AppError::unprocessable(
+            "DRIVE_UNSUPPORTED_PREVIEW",
+            "该文件类型不支持在线预览",
+            vec![FieldError::new("name", "不支持的类型")],
+        ));
+    };
+
+    let expires_at = state.now() + Duration::seconds(WOPI_TOKEN_TTL_SECONDS);
+    let wopi_token_value = wopi_token(
+        &state.config.storage_secret,
+        node_id,
+        expires_at.fixed_offset(),
+    );
+    let document_url = format!(
+        "{}/wopi/files/{}?access_token={}&expires={}",
+        state.config.wopi_base_url,
+        node_id,
+        wopi_token_value,
+        expires_at.timestamp()
+    );
+    let key = format!("{}-{}", node_id, model.updated_at.timestamp());
+    let config = json!({
+        "documentType": document_type,
+        "document": {
+            "fileType": model.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase(),
+            "key": key,
+            "title": model.name,
+            "url": document_url,
+            "permissions": { "edit": false, "download": true, "print": true }
+        },
+        "editorConfig": {
+            "mode": "view",
+            "lang": "zh-CN",
+            "user": { "id": user_id.to_string(), "name": "社团成员" },
+            "customization": { "compactHeader": true, "hideRightMenu": true }
+        }
+    });
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &config,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(AppError::internal)?;
+
+    Ok(Json(json!({
+        "documentServerUrl": state.config.onlyoffice_public_url,
+        "config": config,
+        "token": token
+    }))
+    .into_response())
+}
+
 /// `/api/v1/drive` 路由。
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -1084,6 +1168,18 @@ pub fn router() -> Router<SharedState> {
         .route(
             "/spaces/{id}/nodes/{node_id}/office-token",
             post(office_token),
+        )
+        .route(
+            "/wopi/files/{node_id}",
+            get(wopi_check_file_info).post(wopi_check_file_info),
+        )
+        .route(
+            "/spaces/{id}/nodes/{node_id}/office-token",
+            post(office_token),
+        )
+        .route(
+            "/spaces/{id}/nodes/{node_id}/office-config",
+            get(office_config),
         )
         .route(
             "/wopi/files/{node_id}",

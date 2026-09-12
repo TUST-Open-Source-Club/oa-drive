@@ -42,6 +42,11 @@ pub struct TestApp {
 
 /// 启动测试应用。
 pub async fn spawn() -> TestApp {
+    spawn_with_extra(&[("ONLYOFFICE_JWT_SECRET", "test-onlyoffice-secret")]).await
+}
+
+/// 带额外环境变量启动（用于覆盖 OnlyOffice 开关等配置）。
+pub async fn spawn_with_extra(extra: &[(&str, &str)]) -> TestApp {
     let url = test_database_url();
     let schema = format!("test_{}", Uuid::now_v7().simple());
     let database = db::connect_with_schema(&url, &schema)
@@ -70,6 +75,14 @@ pub async fn spawn() -> TestApp {
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert("DATABASE_URL".to_string(), url);
     env.insert("AUTH_ISSUER".to_string(), "https://oa.test".to_string());
+    env.insert("WOPI_BASE_URL".to_string(), "http://drive.test".to_string());
+    env.insert(
+        "ONLYOFFICE_PUBLIC_URL".to_string(),
+        "http://office.test".to_string(),
+    );
+    for (key, value) in extra {
+        env.insert((*key).to_string(), (*value).to_string());
+    }
     let config = Config::from_map(env).expect("config");
 
     let state = SharedState::new(AppState {

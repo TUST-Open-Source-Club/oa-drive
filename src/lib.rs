@@ -28,6 +28,12 @@ pub mod config {
         pub storage_secret: String,
         /// 分片上传临时目录。
         pub upload_tmp_dir: String,
+        /// OnlyOffice JWT 密钥（空 = 未启用预览）。
+        pub onlyoffice_jwt_secret: Option<String>,
+        /// OnlyOffice 对外地址（浏览器加载 DocsAPI 用）。
+        pub onlyoffice_public_url: String,
+        /// WOPI 回调基地址（OnlyOffice 服务端访问 drive 用）。
+        pub wopi_base_url: String,
         /// S3 端点（driver=s3 时必填）。
         pub s3_endpoint: Option<String>,
         /// S3 区域。
@@ -79,6 +85,22 @@ pub mod config {
                     .get("UPLOAD_TMP_DIR")
                     .cloned()
                     .unwrap_or_else(|| "/tmp/club-oa-uploads".to_string()),
+                onlyoffice_jwt_secret: map
+                    .get("ONLYOFFICE_JWT_SECRET")
+                    .cloned()
+                    .filter(|value| !value.is_empty()),
+                onlyoffice_public_url: map
+                    .get("ONLYOFFICE_PUBLIC_URL")
+                    .cloned()
+                    .unwrap_or_else(|| "http://localhost:8080".to_string())
+                    .trim_end_matches('/')
+                    .to_string(),
+                wopi_base_url: map
+                    .get("WOPI_BASE_URL")
+                    .cloned()
+                    .unwrap_or_else(|| "http://localhost:8087".to_string())
+                    .trim_end_matches('/')
+                    .to_string(),
                 s3_endpoint: map.get("S3_ENDPOINT").cloned(),
                 s3_region: map
                     .get("S3_REGION")

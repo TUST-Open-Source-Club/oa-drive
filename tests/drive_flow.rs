@@ -526,3 +526,152 @@ async fn presign_fallback_and_upload_cancel() {
     .await;
     after.expect(StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn office_preview_config_and_wopi_endpoints() {
+    let app = spawn().await;
+    let user = Uuid::now_v7();
+    let token = issue_token(&app, user);
+    let space_id = create_space(&app, &token).await;
+
+    // 上传 Word 文件
+    let uploaded = upload(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/files?name=report.docx&mime=application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        &token,
+        "application/octet-stream",
+        b"docx-bytes",
+    )
+    .await;
+    let file_id = uploaded.expect(StatusCode::CREATED)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // OnlyOffice 配置
+    let config = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/office-config"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let config = config.expect(StatusCode::OK);
+    assert_eq!(config["documentServerUrl"], "http://office.test");
+    assert_eq!(config["config"]["documentType"], "word");
+    assert!(config["config"]["document"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("http://drive.test/wopi/files/"));
+    assert!(!config["token"].as_str().unwrap().is_empty());
+
+    // 不支持的扩展名 → 422
+    let image = upload(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/files?name=photo.png"),
+        &token,
+        "image/png",
+        b"png",
+    )
+    .await;
+    let image_id = image.expect(StatusCode::CREATED)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unsupported = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{image_id}/office-config"),
+        Some(&token),
+        None,
+    )
+    .await;
+    unsupported.expect(StatusCode::UNPROCESSABLE_ENTITY);
+
+    // WOPI 令牌 + CheckFileInfo + GetFile
+    let wopi_token_response = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/office-token"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let wopi = wopi_token_response.expect(StatusCode::OK);
+    let access_token = wopi["token"].as_str().unwrap().to_string();
+    let expires = wopi["expires"].as_i64().unwrap();
+    let query = format!("access_token={access_token}&expires={expires}");
+
+    let info = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/wopi/files/{file_id}?{query}"),
+        None,
+        None,
+    )
+    .await;
+    let info = info.expect(StatusCode::OK);
+    assert_eq!(info["BaseFileName"], "report.docx");
+    assert_eq!(info["ReadOnly"], true);
+
+    let contents = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/wopi/files/{file_id}/contents?{query}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(contents.status, StatusCode::OK);
+    assert_eq!(contents.bytes, b"docx-bytes");
+
+    // 伪造/缺失令牌 → 403
+    let forged = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/wopi/files/{file_id}?access_token=forged&expires={expires}"),
+        None,
+        None,
+    )
+    .await;
+    forged.expect(StatusCode::FORBIDDEN);
+    let missing = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/wopi/files/{file_id}"),
+        None,
+        None,
+    )
+    .await;
+    missing.expect(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn office_config_requires_configured_secret() {
+    let app = spawn_with_extra(&[("ONLYOFFICE_JWT_SECRET", "")]).await;
+    let user = Uuid::now_v7();
+    let token = issue_token(&app, user);
+    let space_id = create_space(&app, &token).await;
+    let uploaded = upload(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/files?name=a.docx"),
+        &token,
+        "application/octet-stream",
+        b"x",
+    )
+    .await;
+    let file_id = uploaded.expect(StatusCode::CREATED)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/office-config"),
+        Some(&token),
+        None,
+    )
+    .await;
+    response.expect(StatusCode::SERVICE_UNAVAILABLE);
+}
