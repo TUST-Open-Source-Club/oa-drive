@@ -1166,10 +1166,6 @@ pub fn router() -> Router<SharedState> {
         .route("/public/shares/{token}", get(share_info))
         .route("/public/shares/{token}/download", get(share_download))
         .route(
-            "/spaces/{id}/nodes/{node_id}/office-token",
-            post(office_token),
-        )
-        .route(
             "/wopi/files/{node_id}",
             get(wopi_check_file_info).post(wopi_check_file_info),
         )
