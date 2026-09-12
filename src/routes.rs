@@ -15,7 +15,7 @@ use uuid::Uuid;
 use club_auth_sdk::AuthUser;
 use club_common::{new_id, AppError, FieldError};
 
-use crate::entity::{node, space};
+use crate::entity::{node, share, space};
 use crate::repo;
 use crate::state::SharedState;
 
@@ -389,6 +389,141 @@ pub async fn restore_node(
     Ok(Json(NodeDto::from(&restored)))
 }
 
+/// 创建分享请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateShareRequest {
+    /// 有效期（秒，空 = 不过期）。
+    pub expires_in_seconds: Option<i64>,
+    /// 最大下载次数（0 = 不限）。
+    pub max_downloads: Option<i64>,
+}
+
+/// `POST /spaces/{id}/nodes/{node_id}/shares`：创建只读分享链接。
+pub async fn create_share(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, node_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<CreateShareRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
+    if model.deleted_at.is_some() {
+        return Err(AppError::not_found("DRIVE_NODE_NOT_FOUND", "节点不存在"));
+    }
+    let now = state.now();
+    let expires_at = input
+        .expires_in_seconds
+        .map(|seconds| now + Duration::seconds(seconds.clamp(60, 30 * 24 * 3600)));
+    // 64 位十六进制随机 token（两个 UUIDv7 拼接，~148 位随机性）
+    let token = format!("{}{}", new_id().simple(), new_id().simple());
+    let model = repo::create_share(
+        &state.db,
+        model.id,
+        &token,
+        share::PERMISSION_READ,
+        expires_at,
+        input.max_downloads.unwrap_or(0).max(0),
+        user_id,
+        now,
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": model.id, "token": model.token, "url": format!("/s/{}", model.token) })),
+    ))
+}
+
+/// `DELETE /spaces/{id}/shares/{share_id}`：吊销分享。
+pub async fn revoke_share(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, share_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    repo::revoke_share(&state.db, share_id, state.now()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 校验分享有效并返回（分享, 节点）。
+async fn load_valid_share(
+    state: &SharedState,
+    token: &str,
+) -> Result<(share::Model, node::Model), AppError> {
+    let link = repo::find_share_by_token(&state.db, token)
+        .await?
+        .ok_or_else(|| AppError::not_found("DRIVE_SHARE_NOT_FOUND", "分享不存在"))?;
+    let now = state.now();
+    let expired = link
+        .expires_at
+        .map(|expires| expires < now.fixed_offset())
+        .unwrap_or(false);
+    let exhausted = link.max_downloads > 0 && link.download_count >= link.max_downloads;
+    if link.revoked_at.is_some() || expired {
+        return Err(AppError::forbidden("DRIVE_SHARE_INVALID", "分享已失效"));
+    }
+    if exhausted {
+        return Err(AppError::forbidden(
+            "DRIVE_SHARE_EXHAUSTED",
+            "分享下载次数已用完",
+        ));
+    }
+    let node = repo::find_node(&state.db, link.node_id)
+        .await?
+        .filter(|node| node.deleted_at.is_none())
+        .ok_or_else(|| AppError::not_found("DRIVE_SHARE_NOT_FOUND", "分享内容不存在"))?;
+    Ok((link, node))
+}
+
+/// `GET /public/shares/{token}`：公开分享信息。
+pub async fn share_info(
+    State(state): State<SharedState>,
+    Path(token): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let (link, node) = load_valid_share(&state, &token).await?;
+    Ok(Json(json!({
+        "name": node.name,
+        "kind": node.kind,
+        "size": node.size,
+        "mime": node.mime,
+        "permission": link.permission,
+        "maxDownloads": link.max_downloads,
+        "downloadCount": link.download_count
+    })))
+}
+
+/// `GET /public/shares/{token}/download`：公开下载（原子扣减次数）。
+pub async fn share_download(
+    State(state): State<SharedState>,
+    Path(token): Path<String>,
+) -> Result<Response, AppError> {
+    let (link, model) = load_valid_share(&state, &token).await?;
+    if model.kind != node::KIND_FILE {
+        return Err(AppError::bad_request("DRIVE_NOT_FILE", "仅文件可下载"));
+    }
+    if !repo::consume_share_download(&state.db, link.id, state.now()).await? {
+        return Err(AppError::forbidden(
+            "DRIVE_SHARE_EXHAUSTED",
+            "分享下载次数已用完",
+        ));
+    }
+    let key = model
+        .storage_key
+        .clone()
+        .ok_or_else(|| AppError::internal("文件缺少存储 Key"))?;
+    let bytes = state.storage.get(&key).await.map_err(AppError::internal)?;
+    let mut response = bytes.into_response();
+    let filename = percent_encode_header(&model.name);
+    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename*=UTF-8''{}", filename))
+    {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
+    }
+    Ok(response)
+}
+
 /// 请求头文件名百分号编码。
 fn percent_encode_header(name: &str) -> String {
     name.bytes()
@@ -413,4 +548,8 @@ pub fn router() -> Router<SharedState> {
         .route("/spaces/{id}/nodes/{node_id}/restore", post(restore_node))
         .route("/spaces/{id}/nodes/{node_id}/download", get(download_node))
         .route("/spaces/{id}/nodes/{node_id}/ticket", get(node_ticket))
+        .route("/spaces/{id}/nodes/{node_id}/shares", post(create_share))
+        .route("/spaces/{id}/shares/{share_id}", delete(revoke_share))
+        .route("/public/shares/{token}", get(share_info))
+        .route("/public/shares/{token}/download", get(share_download))
 }

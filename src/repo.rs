@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use club_common::{new_id, AppError};
 
-use crate::entity::{node, space, space_member};
+use crate::entity::{node, share, space, space_member};
 
 /// 数据库错误 → 统一错误。
 pub fn map_db_err(err: DbErr) -> AppError {
@@ -203,4 +203,97 @@ pub async fn restore(
     active.deleted_at = Set(None);
     active.updated_at = Set(now.fixed_offset());
     active.update(db).await.map_err(map_db_err)
+}
+
+/// 创建分享链接。
+#[allow(clippy::too_many_arguments)]
+pub async fn create_share(
+    db: &DatabaseConnection,
+    node_id: Uuid,
+    token: &str,
+    permission: &str,
+    expires_at: Option<DateTime<Utc>>,
+    max_downloads: i64,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<share::Model, AppError> {
+    share::ActiveModel {
+        id: Set(new_id()),
+        node_id: Set(node_id),
+        token: Set(token.to_string()),
+        permission: Set(permission.to_string()),
+        expires_at: Set(expires_at.map(|value| value.fixed_offset())),
+        max_downloads: Set(max_downloads),
+        download_count: Set(0),
+        created_by: Set(user_id),
+        created_at: Set(now.fixed_offset()),
+        revoked_at: Set(None),
+    }
+    .insert(db)
+    .await
+    .map_err(map_db_err)
+}
+
+/// 按 token 查询分享。
+pub async fn find_share_by_token(
+    db: &DatabaseConnection,
+    token: &str,
+) -> Result<Option<share::Model>, AppError> {
+    share::Entity::find()
+        .filter(share::Column::Token.eq(token))
+        .one(db)
+        .await
+        .map_err(map_db_err)
+}
+
+/// 原子消费一次下载次数（校验吊销/过期/上限；返回是否成功）。
+pub async fn consume_share_download(
+    db: &DatabaseConnection,
+    share_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    use sea_orm::sea_query::{Expr, ExprTrait};
+    let result = share::Entity::update_many()
+        .col_expr(
+            share::Column::DownloadCount,
+            Expr::col(share::Column::DownloadCount).add(1),
+        )
+        .filter(share::Column::Id.eq(share_id))
+        .filter(share::Column::RevokedAt.is_null())
+        .filter(
+            sea_orm::Condition::any()
+                .add(share::Column::ExpiresAt.is_null())
+                .add(share::Column::ExpiresAt.gte(now.fixed_offset())),
+        )
+        .filter(
+            sea_orm::Condition::any()
+                .add(share::Column::MaxDownloads.eq(0))
+                .add(
+                    Expr::col(share::Column::DownloadCount)
+                        .lt(Expr::col(share::Column::MaxDownloads)),
+                ),
+        )
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(result.rows_affected == 1)
+}
+
+/// 吊销分享。
+pub async fn revoke_share(
+    db: &DatabaseConnection,
+    share_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let result = share::Entity::update_many()
+        .col_expr(
+            share::Column::RevokedAt,
+            sea_orm::sea_query::Expr::value(now.fixed_offset()),
+        )
+        .filter(share::Column::Id.eq(share_id))
+        .filter(share::Column::RevokedAt.is_null())
+        .exec(db)
+        .await
+        .map_err(map_db_err)?;
+    Ok(result.rows_affected > 0)
 }

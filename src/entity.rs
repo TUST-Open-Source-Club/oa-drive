@@ -122,3 +122,46 @@ pub mod node {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// 分享链接。
+pub mod share {
+    use sea_orm::entity::prelude::*;
+
+    /// 只读权限（当前唯一支持）。
+    pub const PERMISSION_READ: &str = "read";
+
+    /// 分享模型（token 全局唯一、支持有效期与下载次数上限）。
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "shares")]
+    pub struct Model {
+        /// ID。
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        /// 分享节点。
+        pub node_id: Uuid,
+        /// 随机 token（URL 安全）。
+        pub token: String,
+        /// 权限：read。
+        pub permission: String,
+        /// 过期时间（空 = 不过期）。
+        #[sea_orm(nullable)]
+        pub expires_at: Option<DateTimeWithTimeZone>,
+        /// 最大下载次数（0 = 不限）。
+        pub max_downloads: i64,
+        /// 已下载次数。
+        pub download_count: i64,
+        /// 创建人。
+        pub created_by: Uuid,
+        /// 创建时间。
+        pub created_at: DateTimeWithTimeZone,
+        /// 吊销时间。
+        #[sea_orm(nullable)]
+        pub revoked_at: Option<DateTimeWithTimeZone>,
+    }
+
+    /// 关系。
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

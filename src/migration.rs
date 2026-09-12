@@ -90,6 +90,50 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
+            .create_table(
+                Table::create()
+                    .table(Shares::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(Shares::Id).uuid().not_null().primary_key())
+                    .col(ColumnDef::new(Shares::NodeId).uuid().not_null())
+                    .col(ColumnDef::new(Shares::Token).string_len(128).not_null())
+                    .col(ColumnDef::new(Shares::Permission).string_len(16).not_null())
+                    .col(ColumnDef::new(Shares::ExpiresAt).timestamp_with_time_zone())
+                    .col(
+                        ColumnDef::new(Shares::MaxDownloads)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(Shares::DownloadCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(Shares::CreatedBy).uuid().not_null())
+                    .col(
+                        ColumnDef::new(Shares::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Shares::RevokedAt).timestamp_with_time_zone())
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("ux_shares_token")
+                    .table(Shares::Table)
+                    .col(Shares::Token)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
             .create_index(
                 Index::create()
                     .name("ix_nodes_space_parent")
@@ -104,6 +148,9 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Shares::Table).if_exists().to_owned())
+            .await?;
         manager
             .drop_table(Table::drop().table(Nodes::Table).if_exists().to_owned())
             .await?;
@@ -162,6 +209,33 @@ pub enum SpaceMembers {
     Role,
     /// joined_at。
     JoinedAt,
+}
+
+/// shares 表标识符。
+#[derive(DeriveIden)]
+pub enum Shares {
+    /// 表。
+    Table,
+    /// id。
+    Id,
+    /// node_id。
+    NodeId,
+    /// token。
+    Token,
+    /// permission。
+    Permission,
+    /// expires_at。
+    ExpiresAt,
+    /// max_downloads。
+    MaxDownloads,
+    /// download_count。
+    DownloadCount,
+    /// created_by。
+    CreatedBy,
+    /// created_at。
+    CreatedAt,
+    /// revoked_at。
+    RevokedAt,
 }
 
 /// nodes 表标识符。
