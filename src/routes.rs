@@ -7,7 +7,10 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{DateTime, Duration, FixedOffset};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -915,6 +918,142 @@ pub async fn complete_presign(
     Ok((StatusCode::CREATED, Json(NodeDto::from(&model))))
 }
 
+/// WOPI Office Token 有效期（秒）。
+const WOPI_TOKEN_TTL_SECONDS: i64 = 300;
+
+/// 生成 WOPI 访问令牌（HMAC：`wopi\n{nodeId}\n{expires}`）。
+fn wopi_token(secret: &str, node_id: Uuid, expires_at: DateTime<FixedOffset>) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    mac.update(format!("wopi\n{node_id}\n{}", expires_at.timestamp()).as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+/// 校验 WOPI 令牌（常量时间比较 + 过期检查）。
+fn verify_wopi_token(
+    secret: &str,
+    node_id: Uuid,
+    expires_at: i64,
+    token: &str,
+) -> Result<(), AppError> {
+    let now = chrono::Utc::now().timestamp();
+    if expires_at < now {
+        return Err(AppError::forbidden(
+            "WOPI_TOKEN_EXPIRED",
+            "Office 访问令牌已过期",
+        ));
+    }
+    let expires = chrono::DateTime::from_timestamp(expires_at, 0)
+        .ok_or_else(|| AppError::bad_request("WOPI_TOKEN_INVALID", "令牌时间非法"))?
+        .fixed_offset();
+    let expected = wopi_token(secret, node_id, expires);
+    if expected != token {
+        return Err(AppError::forbidden(
+            "WOPI_TOKEN_INVALID",
+            "Office 访问令牌无效",
+        ));
+    }
+    Ok(())
+}
+
+/// WOPI 查询参数。
+#[derive(Debug, Deserialize)]
+pub struct WopiQuery {
+    /// 访问令牌。
+    pub access_token: Option<String>,
+    /// 过期时间戳（秒）。
+    pub expires: Option<i64>,
+}
+
+/// `POST /spaces/{id}/nodes/{node_id}/office-token`：签发 WOPI 令牌（供 OnlyOffice 预览配置）。
+pub async fn office_token(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, node_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
+    if model.kind != node::KIND_FILE || model.deleted_at.is_some() {
+        return Err(AppError::not_found("DRIVE_NODE_NOT_FOUND", "文件不存在"));
+    }
+    let expires_at = state.now() + Duration::seconds(WOPI_TOKEN_TTL_SECONDS);
+    let token = wopi_token(
+        &state.config.storage_secret,
+        node_id,
+        expires_at.fixed_offset(),
+    );
+    Ok(Json(
+        json!({ "token": token, "expires": expires_at.timestamp() }),
+    ))
+}
+
+/// 校验 WOPI 请求并返回节点。
+async fn load_wopi_node(
+    state: &SharedState,
+    node_id: Uuid,
+    query: &WopiQuery,
+) -> Result<node::Model, AppError> {
+    let (Some(token), Some(expires)) = (query.access_token.as_deref(), query.expires) else {
+        return Err(AppError::forbidden(
+            "WOPI_TOKEN_MISSING",
+            "缺少 Office 访问令牌",
+        ));
+    };
+    verify_wopi_token(&state.config.storage_secret, node_id, expires, token)?;
+    repo::find_node(&state.db, node_id)
+        .await?
+        .filter(|item| item.kind == node::KIND_FILE && item.deleted_at.is_none())
+        .ok_or_else(|| AppError::not_found("DRIVE_NODE_NOT_FOUND", "文件不存在"))
+}
+
+/// `GET/POST /wopi/files/{node_id}`：WOPI CheckFileInfo。
+pub async fn wopi_check_file_info(
+    State(state): State<SharedState>,
+    Path(node_id): Path<Uuid>,
+    Query(query): Query<WopiQuery>,
+) -> Result<Json<Value>, AppError> {
+    let model = load_wopi_node(&state, node_id, &query).await?;
+    Ok(Json(json!({
+        "BaseFileName": model.name,
+        "Size": model.size,
+        "OwnerId": model.created_by,
+        "UserId": "wopi-user",
+        "UserFriendlyName": "社团 OA",
+        "Version": model.updated_at.timestamp().to_string(),
+        "SupportsUpdate": false,
+        "SupportsLocks": false,
+        "ReadOnly": true
+    })))
+}
+
+/// `GET /wopi/files/{node_id}/contents`：WOPI GetFile。
+pub async fn wopi_get_file(
+    State(state): State<SharedState>,
+    Path(node_id): Path<Uuid>,
+    Query(query): Query<WopiQuery>,
+) -> Result<Response, AppError> {
+    let model = load_wopi_node(&state, node_id, &query).await?;
+    let key = model
+        .storage_key
+        .clone()
+        .ok_or_else(|| AppError::internal("文件缺少存储 Key"))?;
+    if state.local.is_none() {
+        let url = state
+            .storage
+            .presign_get(&key, 300)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::internal("后端不支持预签名"))?;
+        return Ok(Redirect::temporary(&url).into_response());
+    }
+    let bytes = state.storage.get(&key).await.map_err(AppError::internal)?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    Ok(response)
+}
+
 /// `/api/v1/drive` 路由。
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -942,4 +1081,13 @@ pub fn router() -> Router<SharedState> {
         .route("/spaces/{id}/shares/{share_id}", delete(revoke_share))
         .route("/public/shares/{token}", get(share_info))
         .route("/public/shares/{token}/download", get(share_download))
+        .route(
+            "/spaces/{id}/nodes/{node_id}/office-token",
+            post(office_token),
+        )
+        .route(
+            "/wopi/files/{node_id}",
+            get(wopi_check_file_info).post(wopi_check_file_info),
+        )
+        .route("/wopi/files/{node_id}/contents", get(wopi_get_file))
 }
