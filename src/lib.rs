@@ -76,6 +76,14 @@ pub mod db {
 
     /// 创建 schema 并以其为 search_path 连接。
     pub async fn connect_with_schema(url: &str, schema: &str) -> Result<DatabaseConnection, DbErr> {
+        // schema 名仅允许小写字母/数字/下划线，防配置注入
+        if schema.is_empty()
+            || !schema
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(DbErr::Custom(format!("非法 schema 名称: {schema}")));
+        }
         let bootstrap = Database::connect(url).await?;
         bootstrap
             .execute_unprepared(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
