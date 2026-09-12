@@ -8,7 +8,7 @@ use sea_orm_migration::MigratorTrait;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use club_storage::LocalBackend;
+use club_storage::{LocalBackend, S3Backend, StorageBackend};
 use drive_service::config::Config;
 use drive_service::migration::Migrator;
 use drive_service::state::{AppState, SharedState};
@@ -56,15 +56,47 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("数据库迁移失败")?;
 
-    if config.storage_driver != "local" {
-        anyhow::bail!("目前仅支持 local 存储驱动（s3 将在后续接入）");
-    }
-    let local = LocalBackend::new(&config.storage_local_path, config.storage_secret.clone());
+    let (storage, local): (Arc<dyn StorageBackend>, Option<LocalBackend>) =
+        match config.storage_driver.as_str() {
+            "local" => {
+                let backend =
+                    LocalBackend::new(&config.storage_local_path, config.storage_secret.clone());
+                (Arc::new(backend.clone()), Some(backend))
+            }
+            "s3" => {
+                let endpoint = config
+                    .s3_endpoint
+                    .clone()
+                    .context("driver=s3 需要 S3_ENDPOINT")?;
+                let bucket = config
+                    .s3_bucket
+                    .clone()
+                    .context("driver=s3 需要 S3_BUCKET")?;
+                let access_key = config
+                    .s3_access_key
+                    .clone()
+                    .context("driver=s3 需要 S3_ACCESS_KEY")?;
+                let secret_key = config
+                    .s3_secret_key
+                    .clone()
+                    .context("driver=s3 需要 S3_SECRET_KEY")?;
+                let backend = S3Backend::new(
+                    &endpoint,
+                    &config.s3_region,
+                    &bucket,
+                    &access_key,
+                    &secret_key,
+                )
+                .context("初始化 S3 后端失败")?;
+                (Arc::new(backend), None)
+            }
+            other => anyhow::bail!("不支持的存储驱动: {other}（仅 local/s3）"),
+        };
     let state = SharedState::new(AppState {
         db: database,
         config,
-        storage: Arc::new(local.clone()),
-        local: Some(local),
+        storage,
+        local,
         signing_key: RwLock::new(None),
     });
     load_jwks_with_retry(&state).await?;

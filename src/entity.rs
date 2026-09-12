@@ -143,6 +143,9 @@ pub mod share {
         pub token: String,
         /// 权限：read。
         pub permission: String,
+        /// 密码哈希（空 = 无密码）。
+        #[sea_orm(nullable)]
+        pub password_hash: Option<String>,
         /// 过期时间（空 = 不过期）。
         #[sea_orm(nullable)]
         pub expires_at: Option<DateTimeWithTimeZone>,

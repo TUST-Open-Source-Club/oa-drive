@@ -1,9 +1,10 @@
 //! HTTP 路由。
 
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, FixedOffset};
@@ -320,6 +321,16 @@ pub async fn download_node(
         .storage_key
         .clone()
         .ok_or_else(|| AppError::internal("文件缺少存储 Key"))?;
+    // S3 模式：302 跳转到预签名 URL，不经过应用服务器
+    if state.local.is_none() {
+        let url = state
+            .storage
+            .presign_get(&key, 300)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::internal("后端不支持预签名"))?;
+        return Ok(Redirect::temporary(&url).into_response());
+    }
     let bytes = state.storage.get(&key).await.map_err(AppError::internal)?;
     let content_type = model
         .mime
@@ -350,13 +361,20 @@ pub async fn node_ticket(
 ) -> Result<Json<Value>, AppError> {
     let user_id = user_id_of(&auth)?;
     let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
-    let Some(local) = &state.local else {
-        return Err(AppError::internal("S3 预签名待接入"));
-    };
     let key = model
         .storage_key
         .clone()
         .ok_or_else(|| AppError::internal("文件缺少存储 Key"))?;
+    if state.local.is_none() {
+        let url = state
+            .storage
+            .presign_get(&key, 300)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::internal("后端不支持预签名"))?;
+        return Ok(Json(json!({ "url": url, "expiresIn": 300 })));
+    }
+    let local = state.local.as_ref().expect("local 后端已确认");
     let expires_at = state.now() + Duration::minutes(5);
     Ok(Json(json!({
         "url": format!("/api/v1/drive/spaces/{space_id}/nodes/{node_id}/download?expires={}&signature={}",
@@ -389,6 +407,46 @@ pub async fn restore_node(
     Ok(Json(NodeDto::from(&restored)))
 }
 
+/// Argon2 哈希分享密码。
+fn hash_share_password(password: &str) -> Result<String, AppError> {
+    Argon2::default()
+        .hash_password(password.as_bytes())
+        .map(|hash| hash.to_string())
+        .map_err(AppError::internal)
+}
+
+/// 校验分享密码（无密码时直接通过）。
+fn verify_share_password(share: &share::Model, provided: Option<&str>) -> Result<(), AppError> {
+    let Some(hash) = share.password_hash.as_deref() else {
+        return Ok(());
+    };
+    let Some(provided) = provided else {
+        return Err(AppError::unauthorized(
+            "DRIVE_SHARE_PASSWORD_REQUIRED",
+            "需要分享密码",
+        ));
+    };
+    let parsed = PasswordHash::new(hash).map_err(|_| AppError::internal("分享密码哈希损坏"))?;
+    if Argon2::default()
+        .verify_password(provided.as_bytes(), &parsed)
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        Err(AppError::unauthorized(
+            "DRIVE_SHARE_PASSWORD_INVALID",
+            "分享密码错误",
+        ))
+    }
+}
+
+/// 公开访问查询参数。
+#[derive(Debug, Deserialize)]
+pub struct ShareAccess {
+    /// 分享密码。
+    pub password: Option<String>,
+}
+
 /// 创建分享请求。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -397,6 +455,8 @@ pub struct CreateShareRequest {
     pub expires_in_seconds: Option<i64>,
     /// 最大下载次数（0 = 不限）。
     pub max_downloads: Option<i64>,
+    /// 访问密码（可选，4 ~ 64 字符）。
+    pub password: Option<String>,
 }
 
 /// `POST /spaces/{id}/nodes/{node_id}/shares`：创建只读分享链接。
@@ -417,11 +477,30 @@ pub async fn create_share(
         .map(|seconds| now + Duration::seconds(seconds.clamp(60, 30 * 24 * 3600)));
     // 64 位十六进制随机 token（两个 UUIDv7 拼接，~148 位随机性）
     let token = format!("{}{}", new_id().simple(), new_id().simple());
+    let password_hash = match input
+        .password
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(password) if (4..=64).contains(&password.chars().count()) => {
+            Some(hash_share_password(password)?)
+        }
+        Some(_) => {
+            return Err(AppError::unprocessable(
+                "DRIVE_VALIDATION",
+                "分享密码需为 4 ~ 64 字符",
+                vec![FieldError::new("password", "长度不合法")],
+            ))
+        }
+        None => None,
+    };
     let model = repo::create_share(
         &state.db,
         model.id,
         &token,
         share::PERMISSION_READ,
+        password_hash,
         expires_at,
         input.max_downloads.unwrap_or(0).max(0),
         user_id,
@@ -480,9 +559,12 @@ async fn load_valid_share(
 pub async fn share_info(
     State(state): State<SharedState>,
     Path(token): Path<String>,
+    Query(access): Query<ShareAccess>,
 ) -> Result<Json<Value>, AppError> {
     let (link, node) = load_valid_share(&state, &token).await?;
+    verify_share_password(&link, access.password.as_deref())?;
     Ok(Json(json!({
+        "passwordProtected": link.password_hash.is_some(),
         "name": node.name,
         "kind": node.kind,
         "size": node.size,
@@ -497,8 +579,10 @@ pub async fn share_info(
 pub async fn share_download(
     State(state): State<SharedState>,
     Path(token): Path<String>,
+    Query(access): Query<ShareAccess>,
 ) -> Result<Response, AppError> {
     let (link, model) = load_valid_share(&state, &token).await?;
+    verify_share_password(&link, access.password.as_deref())?;
     if model.kind != node::KIND_FILE {
         return Err(AppError::bad_request("DRIVE_NOT_FILE", "仅文件可下载"));
     }

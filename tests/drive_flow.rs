@@ -288,3 +288,95 @@ async fn permission_and_validation_errors() {
     let ready = request(&app.app, "GET", "/readyz", None, None).await;
     assert_eq!(ready.expect(StatusCode::OK)["storage"], "local");
 }
+
+#[tokio::test]
+async fn share_password_protection() {
+    let app = spawn().await;
+    let user = Uuid::now_v7();
+    let token = issue_token(&app, user);
+    let space_id = create_space(&app, &token).await;
+    let uploaded = upload(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/files?name=secret.txt"),
+        &token,
+        "text/plain",
+        b"top-secret",
+    )
+    .await;
+    let file_id = uploaded.expect(StatusCode::CREATED)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let share = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/shares"),
+        Some(&token),
+        Some(&json!({ "password": "pass1234" })),
+    )
+    .await;
+    let share_token = share.expect(StatusCode::CREATED)["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 无密码 → 401
+    let missing = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/public/shares/{share_token}"),
+        None,
+        None,
+    )
+    .await;
+    let missing = missing.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(missing["code"], "DRIVE_SHARE_PASSWORD_REQUIRED");
+
+    // 错误密码 → 401
+    let wrong = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/public/shares/{share_token}?password=nope"),
+        None,
+        None,
+    )
+    .await;
+    let wrong = wrong.expect(StatusCode::UNAUTHORIZED);
+    assert_eq!(wrong["code"], "DRIVE_SHARE_PASSWORD_INVALID");
+
+    // 正确密码 → 200 且标记受保护
+    let info = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/public/shares/{share_token}?password=pass1234"),
+        None,
+        None,
+    )
+    .await;
+    let info = info.expect(StatusCode::OK);
+    assert_eq!(info["passwordProtected"], true);
+
+    // 带密码下载成功
+    let download = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/public/shares/{share_token}/download?password=pass1234"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(download.status, StatusCode::OK);
+    assert_eq!(download.bytes, b"top-secret");
+
+    // 密码过短 → 422
+    let short = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/shares"),
+        Some(&token),
+        Some(&json!({ "password": "x" })),
+    )
+    .await;
+    short.expect(StatusCode::UNPROCESSABLE_ENTITY);
+}

@@ -26,6 +26,16 @@ pub mod config {
         pub storage_local_path: String,
         /// 下载签名密钥。
         pub storage_secret: String,
+        /// S3 端点（driver=s3 时必填）。
+        pub s3_endpoint: Option<String>,
+        /// S3 区域。
+        pub s3_region: String,
+        /// S3 桶名。
+        pub s3_bucket: Option<String>,
+        /// S3 Access Key。
+        pub s3_access_key: Option<String>,
+        /// S3 Secret Key。
+        pub s3_secret_key: Option<String>,
     }
 
     impl Config {
@@ -63,6 +73,14 @@ pub mod config {
                     .get("STORAGE_SECRET")
                     .cloned()
                     .unwrap_or_else(|| "dev-storage-secret".to_string()),
+                s3_endpoint: map.get("S3_ENDPOINT").cloned(),
+                s3_region: map
+                    .get("S3_REGION")
+                    .cloned()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
+                s3_bucket: map.get("S3_BUCKET").cloned(),
+                s3_access_key: map.get("S3_ACCESS_KEY").cloned(),
+                s3_secret_key: map.get("S3_SECRET_KEY").cloned(),
             })
         }
     }
@@ -186,6 +204,7 @@ pub mod state {
 
 pub mod entity;
 pub mod migration;
+pub mod migration2;
 pub mod repo;
 /// HTTP 路由。
 pub mod routes;
