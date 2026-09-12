@@ -380,3 +380,149 @@ async fn share_password_protection() {
     .await;
     short.expect(StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn multipart_upload_flow() {
+    let app = spawn().await;
+    let user = Uuid::now_v7();
+    let token = issue_token(&app, user);
+    let space_id = create_space(&app, &token).await;
+
+    let created = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/uploads"),
+        Some(&token),
+        Some(&json!({ "name": "big.bin", "size": 11, "mime": "application/octet-stream" })),
+    )
+    .await;
+    let session = created.expect(StatusCode::CREATED);
+    let upload_id = session["id"].as_str().unwrap().to_string();
+
+    // 分片必须严格按序
+    let out_of_order = upload_put(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/parts/2"),
+        &token,
+        "application/octet-stream",
+        b"world",
+    )
+    .await;
+    out_of_order.expect(StatusCode::CONFLICT);
+
+    let part1 = upload_put(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/parts/1"),
+        &token,
+        "application/octet-stream",
+        b"hello ",
+    )
+    .await;
+    assert_eq!(part1.expect(StatusCode::OK)["received"], 1);
+    let part2 = upload_put(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/parts/2"),
+        &token,
+        "application/octet-stream",
+        b"world",
+    )
+    .await;
+    assert_eq!(part2.expect(StatusCode::OK)["received"], 2);
+
+    let completed = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/complete"),
+        Some(&token),
+        None,
+    )
+    .await;
+    let completed = completed.expect(StatusCode::CREATED);
+    let file_id = completed["id"].as_str().unwrap().to_string();
+
+    // 合并后的内容一致
+    let download = request(
+        &app.app,
+        "GET",
+        &format!("/api/v1/drive/spaces/{space_id}/nodes/{file_id}/download"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(download.bytes, b"hello world");
+}
+
+#[tokio::test]
+async fn presign_fallback_and_upload_cancel() {
+    let app = spawn().await;
+    let user = Uuid::now_v7();
+    let token = issue_token(&app, user);
+    let space_id = create_space(&app, &token).await;
+
+    // 本地后端不支持预签名直传
+    let presign = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/files/presign"),
+        Some(&token),
+        Some(&json!({ "name": "a.txt" })),
+    )
+    .await;
+    let presign = presign.expect(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(presign["code"], "DRIVE_PRESIGN_UNSUPPORTED");
+
+    // 直传完成校验 storageKey 前缀
+    let bad_complete = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/files/complete"),
+        Some(&token),
+        Some(&json!({ "storageKey": "drive/other-space/key", "name": "a.txt", "size": 1 })),
+    )
+    .await;
+    bad_complete.expect(StatusCode::FORBIDDEN);
+
+    // 空分片完成 → 422；取消后会话消失
+    let created = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/uploads"),
+        Some(&token),
+        Some(&json!({ "name": "cancel.bin", "size": 10 })),
+    )
+    .await;
+    let upload_id = created.expect(StatusCode::CREATED)["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let empty_complete = request(
+        &app.app,
+        "POST",
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/complete"),
+        Some(&token),
+        None,
+    )
+    .await;
+    empty_complete.expect(StatusCode::UNPROCESSABLE_ENTITY);
+
+    let cancel = request(
+        &app.app,
+        "DELETE",
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    cancel.expect(StatusCode::NO_CONTENT);
+
+    let after = upload_put(
+        &app.app,
+        &format!("/api/v1/drive/spaces/{space_id}/uploads/{upload_id}/parts/1"),
+        &token,
+        "application/octet-stream",
+        b"x",
+    )
+    .await;
+    after.expect(StatusCode::NOT_FOUND);
+}

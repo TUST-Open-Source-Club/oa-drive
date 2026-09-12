@@ -26,6 +26,8 @@ pub mod config {
         pub storage_local_path: String,
         /// 下载签名密钥。
         pub storage_secret: String,
+        /// 分片上传临时目录。
+        pub upload_tmp_dir: String,
         /// S3 端点（driver=s3 时必填）。
         pub s3_endpoint: Option<String>,
         /// S3 区域。
@@ -73,6 +75,10 @@ pub mod config {
                     .get("STORAGE_SECRET")
                     .cloned()
                     .unwrap_or_else(|| "dev-storage-secret".to_string()),
+                upload_tmp_dir: map
+                    .get("UPLOAD_TMP_DIR")
+                    .cloned()
+                    .unwrap_or_else(|| "/tmp/club-oa-uploads".to_string()),
                 s3_endpoint: map.get("S3_ENDPOINT").cloned(),
                 s3_region: map
                     .get("S3_REGION")
@@ -205,6 +211,7 @@ pub mod state {
 pub mod entity;
 pub mod migration;
 pub mod migration2;
+pub mod migration3;
 pub mod repo;
 /// HTTP 路由。
 pub mod routes;

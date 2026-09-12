@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use club_common::{new_id, AppError};
 
-use crate::entity::{node, share, space, space_member};
+use crate::entity::{node, share, space, space_member, upload_session};
 
 /// 数据库错误 → 统一错误。
 pub fn map_db_err(err: DbErr) -> AppError {
@@ -298,4 +298,78 @@ pub async fn revoke_share(
         .await
         .map_err(map_db_err)?;
     Ok(result.rows_affected > 0)
+}
+
+/// 创建分片上传会话。
+#[allow(clippy::too_many_arguments)]
+pub async fn create_upload_session(
+    db: &DatabaseConnection,
+    space_id: Uuid,
+    parent_id: Option<Uuid>,
+    name: &str,
+    mime: Option<String>,
+    size: i64,
+    storage_key: &str,
+    user_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<upload_session::Model, AppError> {
+    upload_session::ActiveModel {
+        id: Set(new_id()),
+        space_id: Set(space_id),
+        parent_id: Set(parent_id),
+        name: Set(name.to_string()),
+        mime: Set(mime),
+        size: Set(size),
+        storage_key: Set(storage_key.to_string()),
+        received_parts: Set(0),
+        created_by: Set(user_id),
+        created_at: Set(now.fixed_offset()),
+        updated_at: Set(now.fixed_offset()),
+    }
+    .insert(db)
+    .await
+    .map_err(map_db_err)
+}
+
+/// 查找上传会话。
+pub async fn find_upload_session(
+    db: &DatabaseConnection,
+    id: Uuid,
+) -> Result<Option<upload_session::Model>, AppError> {
+    upload_session::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(map_db_err)
+}
+
+/// 推进已接收分片计数（严格连续：part 必须等于 received+1）。
+pub async fn advance_upload_part(
+    db: &DatabaseConnection,
+    session: &upload_session::Model,
+    part: i32,
+    now: DateTime<Utc>,
+) -> Result<upload_session::Model, AppError> {
+    if part != session.received_parts + 1 {
+        return Err(AppError::conflict(
+            "DRIVE_PART_ORDER",
+            format!(
+                "分片顺序错误：期望 {}，收到 {}",
+                session.received_parts + 1,
+                part
+            ),
+        ));
+    }
+    let mut active: upload_session::ActiveModel = session.clone().into();
+    active.received_parts = Set(session.received_parts + 1);
+    active.updated_at = Set(now.fixed_offset());
+    active.update(db).await.map_err(map_db_err)
+}
+
+/// 删除上传会话（完成或取消）。
+pub async fn delete_upload_session(db: &DatabaseConnection, id: Uuid) -> Result<(), AppError> {
+    upload_session::Entity::delete_by_id(id)
+        .exec(db)
+        .await
+        .map(|_| ())
+        .map_err(map_db_err)
 }

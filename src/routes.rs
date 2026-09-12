@@ -621,6 +621,300 @@ fn percent_encode_header(name: &str) -> String {
         .collect()
 }
 
+/// 创建分片上传会话请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateUploadRequest {
+    /// 文件名。
+    pub name: String,
+    /// MIME。
+    pub mime: Option<String>,
+    /// 总大小。
+    pub size: i64,
+    /// 父目录。
+    pub parent_id: Option<Uuid>,
+}
+
+/// `POST /spaces/{id}/uploads`：创建分片上传会话。
+pub async fn create_upload(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(space_id): Path<Uuid>,
+    Json(input): Json<CreateUploadRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 255 || name.contains('/') {
+        return Err(AppError::unprocessable(
+            "DRIVE_VALIDATION",
+            "文件名不合法",
+            vec![FieldError::new("name", "非法")],
+        ));
+    }
+    if input.size <= 0 || input.size > 50 * 1024 * 1024 * 1024 {
+        return Err(AppError::unprocessable(
+            "DRIVE_VALIDATION",
+            "文件大小需为 0 ~ 50GB",
+            vec![FieldError::new("size", "非法")],
+        ));
+    }
+    validate_parent(&state, space_id, input.parent_id).await?;
+    let storage_key = format!("drive/{}/{}", space_id.simple(), new_id().simple());
+    let session = repo::create_upload_session(
+        &state.db,
+        space_id,
+        input.parent_id,
+        name,
+        input.mime,
+        input.size,
+        &storage_key,
+        user_id,
+        state.now(),
+    )
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({ "id": session.id, "storageKey": session.storage_key, "partSizeHint": 8 * 1024 * 1024 }),
+        ),
+    ))
+}
+
+/// 上传分片临时文件路径。
+fn part_path(state: &SharedState, upload_id: Uuid, part: i32) -> std::path::PathBuf {
+    std::path::PathBuf::from(&state.config.upload_tmp_dir)
+        .join(upload_id.to_string())
+        .join(part.to_string())
+}
+
+/// 加载并校验上传会话。
+async fn load_session(
+    state: &SharedState,
+    user_id: Uuid,
+    space_id: Uuid,
+    upload_id: Uuid,
+) -> Result<crate::entity::upload_session::Model, AppError> {
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    let session = repo::find_upload_session(&state.db, upload_id)
+        .await?
+        .filter(|session| session.space_id == space_id && session.created_by == user_id)
+        .ok_or_else(|| AppError::not_found("DRIVE_UPLOAD_NOT_FOUND", "上传会话不存在"))?;
+    Ok(session)
+}
+
+/// `PUT /spaces/{id}/uploads/{upload_id}/parts/{part}`：上传一个分片（需按序）。
+pub async fn upload_part(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, upload_id, part)): Path<(Uuid, Uuid, i32)>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let session = load_session(&state, user_id, space_id, upload_id).await?;
+    if !(1..=100_000).contains(&part) {
+        return Err(AppError::unprocessable(
+            "DRIVE_VALIDATION",
+            "分片编号不合法",
+            vec![FieldError::new("part", "不合法")],
+        ));
+    }
+    let path = part_path(&state, upload_id, part);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tokio::fs::write(&path, &body)
+        .await
+        .map_err(AppError::internal)?;
+    let updated = repo::advance_upload_part(&state.db, &session, part, state.now()).await?;
+    Ok(Json(json!({ "received": updated.received_parts })))
+}
+
+/// `POST /spaces/{id}/uploads/{upload_id}/complete`：合并分片并入库。
+pub async fn complete_upload(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, upload_id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<NodeDto>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    let session = load_session(&state, user_id, space_id, upload_id).await?;
+    if session.received_parts < 1 {
+        return Err(AppError::unprocessable(
+            "DRIVE_VALIDATION",
+            "尚未上传任何分片",
+            vec![FieldError::new("parts", "为空")],
+        ));
+    }
+    // 按序合并分片（分片连续性已在 advance 时保证）
+    let mut assembled: Vec<u8> = Vec::with_capacity(session.size as usize);
+    for part in 1..=session.received_parts {
+        let chunk = tokio::fs::read(part_path(&state, upload_id, part))
+            .await
+            .map_err(AppError::internal)?;
+        assembled.extend_from_slice(&chunk);
+    }
+    state
+        .storage
+        .put(
+            &session.storage_key,
+            Bytes::from(assembled),
+            session
+                .mime
+                .as_deref()
+                .unwrap_or("application/octet-stream"),
+        )
+        .await
+        .map_err(AppError::internal)?;
+    let model = repo::create_file(
+        &state.db,
+        space_id,
+        session.parent_id,
+        &session.name,
+        session.mime.clone(),
+        session.storage_key.clone(),
+        session.size,
+        None,
+        user_id,
+        state.now(),
+    )
+    .await?;
+    // 清理
+    let _ = tokio::fs::remove_dir_all(
+        std::path::PathBuf::from(&state.config.upload_tmp_dir).join(upload_id.to_string()),
+    )
+    .await;
+    repo::delete_upload_session(&state.db, upload_id).await?;
+    Ok((StatusCode::CREATED, Json(NodeDto::from(&model))))
+}
+
+/// `DELETE /spaces/{id}/uploads/{upload_id}`：取消上传。
+pub async fn cancel_upload(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, upload_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_session(&state, user_id, space_id, upload_id).await?;
+    let _ = tokio::fs::remove_dir_all(
+        std::path::PathBuf::from(&state.config.upload_tmp_dir).join(upload_id.to_string()),
+    )
+    .await;
+    repo::delete_upload_session(&state.db, upload_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 申请直传请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresignUploadRequest {
+    /// 文件名。
+    pub name: String,
+    /// MIME。
+    pub mime: Option<String>,
+    /// 大小（可选，用于预检）。
+    pub size: Option<i64>,
+    /// 父目录。
+    pub parent_id: Option<Uuid>,
+}
+
+/// `POST /spaces/{id}/files/presign`：S3 预签名直传（本地后端不支持）。
+pub async fn presign_upload(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(space_id): Path<Uuid>,
+    Json(input): Json<PresignUploadRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 255 || name.contains('/') {
+        return Err(AppError::unprocessable(
+            "DRIVE_VALIDATION",
+            "文件名不合法",
+            vec![FieldError::new("name", "非法")],
+        ));
+    }
+    validate_parent(&state, space_id, input.parent_id).await?;
+    let storage_key = format!("drive/{}/{}", space_id.simple(), new_id().simple());
+    let Some(url) = state
+        .storage
+        .presign_put(&storage_key, 900)
+        .await
+        .map_err(AppError::internal)?
+    else {
+        return Err(AppError::unprocessable(
+            "DRIVE_PRESIGN_UNSUPPORTED",
+            "当前存储后端不支持预签名直传，请使用服务端上传或分片上传",
+            vec![FieldError::new("storage", "local 后端")],
+        ));
+    };
+    Ok(Json(
+        json!({ "storageKey": storage_key, "uploadUrl": url, "expiresIn": 900 }),
+    ))
+}
+
+/// 直传完成请求。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletePresignRequest {
+    /// 直传返回的 storageKey。
+    pub storage_key: String,
+    /// 文件名。
+    pub name: String,
+    /// MIME。
+    pub mime: Option<String>,
+    /// 大小。
+    pub size: i64,
+    /// 父目录。
+    pub parent_id: Option<Uuid>,
+}
+
+/// `POST /spaces/{id}/files/complete`：直传完成后登记节点。
+pub async fn complete_presign(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(space_id): Path<Uuid>,
+    Json(input): Json<CompletePresignRequest>,
+) -> Result<(StatusCode, Json<NodeDto>), AppError> {
+    let user_id = user_id_of(&auth)?;
+    repo::ensure_member(&state.db, space_id, user_id).await?;
+    let expected_prefix = format!("drive/{}/", space_id.simple());
+    if !input.storage_key.starts_with(&expected_prefix) {
+        return Err(AppError::forbidden(
+            "DRIVE_INVALID_KEY",
+            "storageKey 不属于该空间",
+        ));
+    }
+    if !state
+        .storage
+        .exists(&input.storage_key)
+        .await
+        .map_err(AppError::internal)?
+    {
+        return Err(AppError::bad_request(
+            "DRIVE_OBJECT_MISSING",
+            "尚未检测到已上传文件",
+        ));
+    }
+    validate_parent(&state, space_id, input.parent_id).await?;
+    let model = repo::create_file(
+        &state.db,
+        space_id,
+        input.parent_id,
+        input.name.trim(),
+        input.mime,
+        input.storage_key,
+        input.size,
+        None,
+        user_id,
+        state.now(),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(NodeDto::from(&model))))
+}
+
 /// `/api/v1/drive` 路由。
 pub fn router() -> Router<SharedState> {
     Router::new()
@@ -628,6 +922,18 @@ pub fn router() -> Router<SharedState> {
         .route("/spaces/{id}/nodes", get(list_nodes))
         .route("/spaces/{id}/folders", post(create_folder))
         .route("/spaces/{id}/files", post(upload_file))
+        .route("/spaces/{id}/files/presign", post(presign_upload))
+        .route("/spaces/{id}/files/complete", post(complete_presign))
+        .route("/spaces/{id}/uploads", post(create_upload))
+        .route(
+            "/spaces/{id}/uploads/{upload_id}/parts/{part}",
+            axum::routing::put(upload_part),
+        )
+        .route(
+            "/spaces/{id}/uploads/{upload_id}/complete",
+            post(complete_upload),
+        )
+        .route("/spaces/{id}/uploads/{upload_id}", delete(cancel_upload))
         .route("/spaces/{id}/nodes/{node_id}", delete(delete_node))
         .route("/spaces/{id}/nodes/{node_id}/restore", post(restore_node))
         .route("/spaces/{id}/nodes/{node_id}/download", get(download_node))

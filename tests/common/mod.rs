@@ -150,6 +150,17 @@ pub async fn upload(
     send(app, "POST", uri, Some(token), body.to_vec(), content_type).await
 }
 
+/// 以 PUT 上传原始字节（分片上传用）。
+pub async fn upload_put(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    content_type: &str,
+    body: &[u8],
+) -> TestResponse {
+    send(app, "PUT", uri, Some(token), body.to_vec(), content_type).await
+}
+
 /// 发送请求并读取原始响应。
 async fn send(
     app: &Router,

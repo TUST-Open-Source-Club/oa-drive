@@ -168,3 +168,48 @@ pub mod share {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+/// 分片上传会话。
+pub mod upload_session {
+    use sea_orm::entity::prelude::*;
+
+    /// 会话状态：uploading / completed（完成即删除记录）。
+    pub const STATUS_UPLOADING: &str = "uploading";
+
+    /// 上传会话模型（parts 连续递增，落临时目录，完成时合并入存储）。
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "upload_sessions")]
+    pub struct Model {
+        /// 会话 ID。
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        /// 目标空间。
+        pub space_id: Uuid,
+        /// 父目录。
+        #[sea_orm(nullable)]
+        pub parent_id: Option<Uuid>,
+        /// 文件名。
+        pub name: String,
+        /// MIME。
+        #[sea_orm(nullable)]
+        pub mime: Option<String>,
+        /// 预期总大小。
+        pub size: i64,
+        /// 目标存储 Key。
+        pub storage_key: String,
+        /// 已接收分片数（要求严格连续，从 1 开始）。
+        pub received_parts: i32,
+        /// 创建者。
+        pub created_by: Uuid,
+        /// 创建时间。
+        pub created_at: DateTimeWithTimeZone,
+        /// 更新时间。
+        pub updated_at: DateTimeWithTimeZone,
+    }
+
+    /// 关系。
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
