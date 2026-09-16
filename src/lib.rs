@@ -254,6 +254,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/readyz", axum::routing::get(routes::readyz))
         .nest("/api/v1/drive", routes::router())
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(axum::middleware::from_fn(|req, next| {
+            club_auth_sdk::guard::guard_bot_request(req, next, "drive")
+        }))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
