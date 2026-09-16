@@ -14,6 +14,7 @@ base64 = "0.23.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 club-auth-sdk = { version = "0.1.0", path = "libs/crates/auth-sdk" }
+club-bus = { version = "0.1.0", path = "libs/crates/bus" }
 club-common = { version = "0.1.0", path = "libs/crates/common" }
 club-storage = { version = "0.1.0", path = "libs/crates/storage", features = ["s3"] }
 hex = "0.4.3"
