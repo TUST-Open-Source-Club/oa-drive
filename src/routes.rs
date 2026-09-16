@@ -395,7 +395,19 @@ pub async fn delete_node(
 ) -> Result<StatusCode, AppError> {
     let user_id = user_id_of(&auth)?;
     let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
+    let before_snapshot = serde_json::to_value(NodeDto::from(&model)).map_err(AppError::internal)?;
     repo::soft_delete(&state.db, &model, state.now()).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "drive_node",
+        &model.id.to_string(),
+        "delete",
+        Some(before_snapshot),
+        None,
+        Some(user_id),
+        state.now(),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -408,6 +420,59 @@ pub async fn restore_node(
     let user_id = user_id_of(&auth)?;
     let model = load_node_for_member(&state, user_id, space_id, node_id).await?;
     let restored = repo::restore(&state.db, &model, state.now()).await?;
+    Ok(Json(NodeDto::from(&restored)))
+}
+
+/// `GET /spaces/{id}/nodes/{node_id}/changes`：文件操作记录。
+pub async fn list_node_changes(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path((space_id, node_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Vec<club_bus::audit::ChangeEntry>>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    load_node_for_member(&state, user_id, space_id, node_id).await?;
+    let items = club_bus::audit::list_for(&state.db, "drive_node", &node_id.to_string(), 50)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(Json(items))
+}
+
+/// `POST /changes/{id}/undo`：撤销删除（从回收站恢复）。
+pub async fn undo_change(
+    State(state): State<SharedState>,
+    auth: AuthUser,
+    Path(change_id): Path<Uuid>,
+) -> Result<Json<NodeDto>, AppError> {
+    let user_id = user_id_of(&auth)?;
+    let entry = club_bus::audit::find(&state.db, change_id)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(|| AppError::not_found("DRIVE_CHANGE_NOT_FOUND", "变更记录不存在"))?;
+    if entry.entity != "drive_node" || entry.action != "delete" {
+        return Err(AppError::unprocessable(
+            "DRIVE_UNDO_UNSUPPORTED",
+            "仅支持撤销删除操作",
+            vec![],
+        ));
+    }
+    let node_id: Uuid = entry.entity_id.parse().map_err(AppError::internal)?;
+    let model = repo::find_node(&state.db, node_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("DRIVE_NODE_NOT_FOUND", "节点不存在"))?;
+    load_node_for_member(&state, user_id, model.space_id, node_id).await?;
+    let now = state.now();
+    let restored = repo::restore(&state.db, &model, now).await?;
+    let _ = club_bus::audit::record(
+        &state.db,
+        "drive_node",
+        &restored.id.to_string(),
+        "undo",
+        Some(serde_json::to_value(NodeDto::from(&restored)).map_err(AppError::internal)?),
+        None,
+        Some(user_id),
+        now,
+    )
+    .await;
     Ok(Json(NodeDto::from(&restored)))
 }
 
@@ -1159,6 +1224,11 @@ pub fn router() -> Router<SharedState> {
         .route("/spaces/{id}/uploads/{upload_id}", delete(cancel_upload))
         .route("/spaces/{id}/nodes/{node_id}", delete(delete_node))
         .route("/spaces/{id}/nodes/{node_id}/restore", post(restore_node))
+        .route(
+            "/spaces/{id}/nodes/{node_id}/changes",
+            get(list_node_changes),
+        )
+        .route("/changes/{id}/undo", post(undo_change))
         .route("/spaces/{id}/nodes/{node_id}/download", get(download_node))
         .route("/spaces/{id}/nodes/{node_id}/ticket", get(node_ticket))
         .route("/spaces/{id}/nodes/{node_id}/shares", post(create_share))

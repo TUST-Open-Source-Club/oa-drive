@@ -179,6 +179,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration),
             Box::new(crate::migration2::Migration),
             Box::new(crate::migration3::Migration),
+                Box::new(crate::migration4::Migration),
         ]
     }
 }
